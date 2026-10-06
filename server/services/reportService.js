@@ -9,24 +9,26 @@ const db = require('../db');
  * @param {string} fechaRef - YYYY-MM-DD
  * @param {number|null} listaId - ID de lista individual (opcional)
  */
-function getReportData(tipo, fechaRef, listaId = null) {
+async function getReportData(tipo, fechaRef, listaId = null) {
   let whereClause = '';
   const params = [];
 
   if (listaId) {
-    // Descarga de lista individual específica
     whereClause = 'WHERE al.id = ?';
     params.push(listaId);
   } else if (tipo === 'diario') {
     whereClause = 'WHERE al.fecha_guardado = ?';
     params.push(fechaRef);
   } else if (tipo === 'semanal') {
-    whereClause = `WHERE al.fecha_guardado BETWEEN date(?, '-6 days') AND date(?)`;
-    params.push(fechaRef, fechaRef);
+    const d = new Date(fechaRef);
+    d.setDate(d.getDate() - 6);
+    const startFecha = d.toISOString().split('T')[0];
+    whereClause = 'WHERE al.fecha_guardado >= ? AND al.fecha_guardado <= ?';
+    params.push(startFecha, fechaRef);
   } else if (tipo === 'mensual') {
     const mesRef = fechaRef.substring(0, 7);
-    whereClause = `WHERE strftime('%Y-%m', al.fecha_guardado) = ?`;
-    params.push(mesRef);
+    whereClause = 'WHERE al.fecha_guardado LIKE ?';
+    params.push(`${mesRef}%`);
   } else {
     whereClause = 'WHERE al.fecha_guardado = ?';
     params.push(fechaRef);
@@ -58,18 +60,18 @@ function getReportData(tipo, fechaRef, listaId = null) {
     ORDER BY al.fecha_guardado DESC, e.titulo ASC, p.comuna ASC, p.nombre_apellido ASC
   `;
 
-  const rows = db.prepare(query).all(...params);
+  const rows = await db.prepare(query).all(...params);
 
   // Totales
   const totalRegistros = rows.length;
-  const totalAsistentes = rows.filter(r => r.asistio === 1).length;
-  const totalAusentes = rows.filter(r => r.asistio === 0).length;
+  const totalAsistentes = rows.filter(r => parseInt(r.asistio) === 1).length;
+  const totalAusentes = rows.filter(r => parseInt(r.asistio) === 0).length;
   const porcentajeAsistencia = totalRegistros > 0 ? ((totalAsistentes / totalRegistros) * 100).toFixed(1) : '0.0';
 
   return {
     tipo,
     fechaRef,
-    rows,
+    rows: rows.map(r => ({ ...r, asistio: parseInt(r.asistio) })),
     resumen: {
       totalRegistros,
       totalAsistentes,
@@ -83,7 +85,7 @@ function getReportData(tipo, fechaRef, listaId = null) {
  * Genera un archivo Excel (.xlsx) y devuelve el Buffer
  */
 async function generarExcelReporte(tipo, fechaRef, listaId = null) {
-  const data = getReportData(tipo, fechaRef, listaId);
+  const data = await getReportData(tipo, fechaRef, listaId);
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'Sistema de Registro de Asistencia';
   workbook.created = new Date();
@@ -95,7 +97,7 @@ async function generarExcelReporte(tipo, fechaRef, listaId = null) {
   const titleCell = worksheet.getCell('A1');
   titleCell.value = `SISTEMA DE ASISTENCIA - REPORTE ${tipo.toUpperCase()}`;
   titleCell.font = { name: 'Arial', size: 16, bold: true, color: { argb: 'FFFFFF' } };
-  titleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '991B1B' } }; // Dark red
+  titleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '991B1B' } };
   titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
   worksheet.getRow(1).height = 35;
 
@@ -125,7 +127,7 @@ async function generarExcelReporte(tipo, fechaRef, listaId = null) {
   headerRow.height = 25;
   headerRow.eachCell((cell) => {
     cell.font = { name: 'Arial', size: 11, bold: true, color: { argb: 'FFFFFF' } };
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '1E293B' } }; // Slate 800
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '1E293B' } };
     cell.alignment = { horizontal: 'center', vertical: 'middle' };
     cell.border = {
       top: { style: 'thin' },
@@ -152,13 +154,12 @@ async function generarExcelReporte(tipo, fechaRef, listaId = null) {
 
     row.height = 20;
 
-    // Colorear estado de asistencia
     const asistenciaCell = row.getCell(9);
     if (r.asistio === 1) {
-      asistenciaCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'DCFCE7' } }; // Light green
+      asistenciaCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'DCFCE7' } };
       asistenciaCell.font = { color: { argb: '166534' }, bold: true };
     } else {
-      asistenciaCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FEE2E2' } }; // Light red
+      asistenciaCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FEE2E2' } };
       asistenciaCell.font = { color: { argb: '991B1B' }, bold: true };
     }
 
@@ -190,8 +191,8 @@ async function generarExcelReporte(tipo, fechaRef, listaId = null) {
 /**
  * Genera un archivo PDF y escribe al res Stream
  */
-function generarPDFReporte(tipo, fechaRef, res, listaId = null) {
-  const data = getReportData(tipo, fechaRef, listaId);
+async function generarPDFReporte(tipo, fechaRef, res, listaId = null) {
+  const data = await getReportData(tipo, fechaRef, listaId);
   const doc = new PDFDocument({ margin: 30, size: 'A4', layout: 'landscape' });
 
   doc.pipe(res);
@@ -234,11 +235,9 @@ function generarPDFReporte(tipo, fechaRef, res, listaId = null) {
   currentY += 20;
 
   data.rows.forEach((r, idx) => {
-    // Si excede la página, agregar nueva página
     if (currentY > doc.page.height - 50) {
       doc.addPage({ margin: 30, layout: 'landscape' });
       currentY = 30;
-      // Re-draw header
       doc.rect(30, currentY, doc.page.width - 60, 20).fill('#1E293B');
       doc.fillColor('#FFFFFF').fontSize(9).font('Helvetica-Bold');
       doc.text('Fecha/Hora', 35, currentY + 5, { width: 90 });

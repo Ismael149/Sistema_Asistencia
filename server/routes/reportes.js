@@ -5,12 +5,8 @@ const { verifyAdmin } = require('../middleware/authMiddleware');
 const { getReportData, generarExcelReporte, generarPDFReporte } = require('../services/reportService');
 const { registrarBitacora } = require('../services/bitacoraService');
 
-/**
- * GET /api/reportes/listas
- * Devuelve las listas de asistencia guardadas filtradas por período, con estadísticas resumidas.
- * Parámetros: tipo ('diario'|'semanal'|'mensual'), fecha (YYYY-MM-DD)
- */
-router.get('/listas', verifyAdmin, (req, res) => {
+// GET /api/reportes/listas
+router.get('/listas', verifyAdmin, async (req, res) => {
   const { tipo, fecha } = req.query;
   const fechaRef = fecha || new Date().toISOString().split('T')[0];
   const tipoVal = (tipo || 'diario').toLowerCase();
@@ -22,18 +18,19 @@ router.get('/listas', verifyAdmin, (req, res) => {
     whereClause = 'WHERE al.fecha_guardado = ?';
     params.push(fechaRef);
   } else if (tipoVal === 'semanal') {
-    // Los 7 días hacia atrás desde la fecha de hoy (inclusive)
-    whereClause = `WHERE al.fecha_guardado BETWEEN date(?, '-6 days') AND date(?)`;
-    params.push(fechaRef, fechaRef);
+    const d = new Date(fechaRef);
+    d.setDate(d.getDate() - 6);
+    const startFecha = d.toISOString().split('T')[0];
+    whereClause = 'WHERE al.fecha_guardado >= ? AND al.fecha_guardado <= ?';
+    params.push(startFecha, fechaRef);
   } else if (tipoVal === 'mensual') {
-    // Todo el mes del año y mes de fechaRef (YYYY-MM)
     const mesRef = fechaRef.substring(0, 7);
-    whereClause = `WHERE strftime('%Y-%m', al.fecha_guardado) = ?`;
-    params.push(mesRef);
+    whereClause = 'WHERE al.fecha_guardado LIKE ?';
+    params.push(`${mesRef}%`);
   }
 
   try {
-    const listas = db.prepare(`
+    const listas = await db.prepare(`
       SELECT
         al.id,
         al.nombre_lista,
@@ -55,16 +52,23 @@ router.get('/listas', verifyAdmin, (req, res) => {
       ORDER BY al.fecha_guardado DESC, al.hora_guardado DESC
     `).all(...params);
 
+    const listasFormateadas = listas.map(l => ({
+      ...l,
+      total_personas: parseInt(l.total_personas || 0),
+      total_presentes: parseInt(l.total_presentes || 0),
+      total_ausentes: parseInt(l.total_ausentes || 0)
+    }));
+
     // Calcular resumen global del período
-    const totalRegistros = listas.reduce((s, l) => s + l.total_personas, 0);
-    const totalAsistentes = listas.reduce((s, l) => s + l.total_presentes, 0);
-    const totalAusentes = listas.reduce((s, l) => s + l.total_ausentes, 0);
+    const totalRegistros = listasFormateadas.reduce((s, l) => s + l.total_personas, 0);
+    const totalAsistentes = listasFormateadas.reduce((s, l) => s + l.total_presentes, 0);
+    const totalAusentes = listasFormateadas.reduce((s, l) => s + l.total_ausentes, 0);
     const porcentajeAsistencia = totalRegistros > 0
       ? ((totalAsistentes / totalRegistros) * 100).toFixed(1) + '%'
       : '0.0%';
 
     return res.json({
-      listas,
+      listas: listasFormateadas,
       resumen: { totalRegistros, totalAsistentes, totalAusentes, porcentajeAsistencia },
       tipo: tipoVal,
       fechaRef
@@ -75,11 +79,7 @@ router.get('/listas', verifyAdmin, (req, res) => {
   }
 });
 
-/**
- * GET /api/reportes/excel
- * Descarga el reporte de asistencia en formato Excel (.xlsx) (Solo Admin)
- * Parámetros: tipo, fecha  ─ O ─  lista_id (para descargar lista individual)
- */
+// GET /api/reportes/excel
 router.get('/excel', verifyAdmin, async (req, res) => {
   const { tipo, fecha, lista_id } = req.query;
   const fechaRef = fecha || new Date().toISOString().split('T')[0];
@@ -88,7 +88,7 @@ router.get('/excel', verifyAdmin, async (req, res) => {
   try {
     const buffer = await generarExcelReporte(tipoVal, fechaRef, lista_id ? parseInt(lista_id) : null);
 
-    registrarBitacora({
+    await registrarBitacora({
       usuarioId: req.user.id,
       usuarioNombre: req.user.nombre,
       rol: req.user.rol,
@@ -112,11 +112,8 @@ router.get('/excel', verifyAdmin, async (req, res) => {
   }
 });
 
-/**
- * GET /api/reportes/pdf
- * Descarga el reporte en formato PDF (Solo Admin)
- */
-router.get('/pdf', verifyAdmin, (req, res) => {
+// GET /api/reportes/pdf
+router.get('/pdf', verifyAdmin, async (req, res) => {
   const { tipo, fecha, lista_id } = req.query;
   const fechaRef = fecha || new Date().toISOString().split('T')[0];
   const tipoVal = (tipo || 'diario').toLowerCase();
@@ -129,7 +126,7 @@ router.get('/pdf', verifyAdmin, (req, res) => {
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
 
-    registrarBitacora({
+    await registrarBitacora({
       usuarioId: req.user.id,
       usuarioNombre: req.user.nombre,
       rol: req.user.rol,
@@ -140,7 +137,7 @@ router.get('/pdf', verifyAdmin, (req, res) => {
       ip: req.ip
     });
 
-    generarPDFReporte(tipoVal, fechaRef, res, lista_id ? parseInt(lista_id) : null);
+    await generarPDFReporte(tipoVal, fechaRef, res, lista_id ? parseInt(lista_id) : null);
   } catch (err) {
     console.error('Error al exportar PDF:', err);
     return res.status(500).json({ error: 'Error al generar el archivo PDF.' });
