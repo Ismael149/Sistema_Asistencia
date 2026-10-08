@@ -1,7 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
-const xlsx = require('xlsx');
+const { parseAllPersonasFromExcels } = require('./services/excelImporter');
 
 let db;
 const isPostgres = !!process.env.DATABASE_URL;
@@ -18,10 +18,11 @@ if (isPostgres) {
   function formatPgSql(sql) {
     let index = 1;
     let formatted = sql.replace(/\?/g, () => `$${index++}`);
-    // Replace SQLite specific functions with PG equivalent
-    formatted = formatted.replace(/INSERT OR IGNORE INTO/gi, 'INSERT INTO');
     if (sql.includes('INSERT OR IGNORE INTO personas')) {
-      formatted += ' ON CONFLICT (cedula) DO NOTHING';
+      formatted = formatted.replace(/INSERT OR IGNORE INTO personas/gi, 'INSERT INTO personas');
+      formatted += ' ON CONFLICT (cedula, comuna) DO NOTHING';
+    } else {
+      formatted = formatted.replace(/INSERT OR IGNORE INTO/gi, 'INSERT INTO');
     }
     return formatted;
   }
@@ -52,9 +53,8 @@ if (isPostgres) {
         },
         async run(...params) {
           try {
-            // If INSERT query and lacks RETURNING id, append it to capture lastInsertRowid
             let finalSql = pgSql;
-            if (/INSERT\s+INTO/i.test(finalSql) && !/RETURNING/i.test(finalSql) && !/ON CONFLICT DO NOTHING/i.test(finalSql)) {
+            if (/INSERT\s+INTO/i.test(finalSql) && !/RETURNING/i.test(finalSql) && !/ON CONFLICT/i.test(finalSql)) {
               finalSql += ' RETURNING id';
             }
             const res = await pool.query(finalSql, params.flat());
@@ -75,7 +75,6 @@ if (isPostgres) {
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
-          // Proxy db.prepare to run on client inside transaction
           const originalPrepare = db.prepare;
           db.prepare = (sql) => {
             const pgSql = formatPgSql(sql);
@@ -90,7 +89,7 @@ if (isPostgres) {
               },
               async run(...params) {
                 let finalSql = pgSql;
-                if (/INSERT\s+INTO/i.test(finalSql) && !/RETURNING/i.test(finalSql) && !/ON CONFLICT DO NOTHING/i.test(finalSql)) {
+                if (/INSERT\s+INTO/i.test(finalSql) && !/RETURNING/i.test(finalSql) && !/ON CONFLICT/i.test(finalSql)) {
                   finalSql += ' RETURNING id';
                 }
                 const res = await client.query(finalSql, params.flat());
@@ -165,14 +164,15 @@ async function initPostgresDatabase() {
 
       CREATE TABLE IF NOT EXISTS personas (
         id SERIAL PRIMARY KEY,
-        cedula VARCHAR(255) UNIQUE NOT NULL,
+        cedula VARCHAR(255) NOT NULL,
         nombre_apellido TEXT NOT NULL,
         municipio TEXT,
         comuna TEXT,
         comision TEXT,
         telefono TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT unique_persona_comuna UNIQUE(cedula, comuna)
       );
 
       CREATE TABLE IF NOT EXISTS eventos (
@@ -223,6 +223,16 @@ async function initPostgresDatabase() {
       );
     `);
 
+    // In case the personas table in PG was previously created with UNIQUE(cedula)
+    try {
+      await db.pool.query(`
+        ALTER TABLE personas DROP CONSTRAINT IF EXISTS personas_cedula_key;
+        ALTER TABLE personas ADD CONSTRAINT unique_persona_comuna UNIQUE (cedula, comuna);
+      `);
+    } catch (e) {
+      // Constraint might already exist
+    }
+
     await seedUsers();
     await seedPersonasFromExcel();
     await seedSampleEvents();
@@ -239,6 +249,32 @@ async function initPostgresDatabase() {
 function initSqliteDatabase(sqliteDb) {
   console.log('📦 Inicializando Base de Datos SQLite...');
 
+  // Ensure personas table has UNIQUE(cedula, comuna)
+  const personasTable = sqliteDb.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='personas'").get();
+  if (personasTable && !personasTable.sql.includes('UNIQUE(cedula, comuna)') && !personasTable.sql.includes('UNIQUE (cedula, comuna)')) {
+    console.log('🔄 Actualizando restricción de tabla personas a UNIQUE(cedula, comuna)...');
+    sqliteDb.pragma('foreign_keys = OFF');
+    sqliteDb.exec(`
+      CREATE TABLE personas_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cedula TEXT NOT NULL,
+        nombre_apellido TEXT NOT NULL,
+        municipio TEXT,
+        comuna TEXT,
+        comision TEXT,
+        telefono TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(cedula, comuna)
+      );
+      INSERT INTO personas_new (id, cedula, nombre_apellido, municipio, comuna, comision, telefono, created_at, updated_at)
+      SELECT id, cedula, nombre_apellido, municipio, comuna, comision, telefono, created_at, updated_at FROM personas;
+      DROP TABLE personas;
+      ALTER TABLE personas_new RENAME TO personas;
+    `);
+    sqliteDb.pragma('foreign_keys = ON');
+  }
+
   sqliteDb.exec(`
     CREATE TABLE IF NOT EXISTS usuarios (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -251,14 +287,15 @@ function initSqliteDatabase(sqliteDb) {
 
     CREATE TABLE IF NOT EXISTS personas (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      cedula TEXT UNIQUE NOT NULL,
+      cedula TEXT NOT NULL,
       nombre_apellido TEXT NOT NULL,
       municipio TEXT,
       comuna TEXT,
       comision TEXT,
       telefono TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(cedula, comuna)
     );
 
     CREATE TABLE IF NOT EXISTS eventos (
@@ -374,155 +411,81 @@ function seedUsersSync() {
 }
 
 async function seedPersonasFromExcel() {
-  const { count } = await db.prepare('SELECT COUNT(*) as count FROM personas').get();
-
-  if (parseInt(count || 0) > 0) {
-    console.log(`ℹ️ La base de datos ya contiene ${count} personas.`);
-    return;
-  }
-
-  const excelPath = path.join(__dirname, '../Equipos Comunales PSUV BOLIVAR.xlsx');
-  if (!fs.existsSync(excelPath)) {
-    console.warn('⚠️ No se encontró el archivo Excel "Equipos Comunales PSUV BOLIVAR.xlsx" para sembrar personas.');
-    return;
-  }
-
-  console.log('📊 Leyendo y cargando datos desde Equipos Comunales PSUV BOLIVAR.xlsx...');
+  console.log('📊 Verificando e importando personas de los archivos Excel...');
   try {
-    const workbook = xlsx.readFile(excelPath);
+    const personas = parseAllPersonasFromExcels();
     let importedCount = 0;
 
-    for (const sheetName of workbook.SheetNames) {
-      const sheet = workbook.Sheets[sheetName];
-      const data = xlsx.utils.sheet_to_json(sheet, { header: 1 });
-
-      let headerIdx = -1;
-      for (let i = 0; i < data.length; i++) {
-        const rowStr = (data[i] || []).map(c => String(c)).join(' ').toUpperCase();
-        if (rowStr.includes('NOMBRE') || rowStr.includes('CEDULA')) {
-          headerIdx = i;
-          break;
-        }
-      }
-
-      if (headerIdx !== -1) {
-        for (let j = headerIdx + 1; j < data.length; j++) {
-          const r = data[j];
-          if (!r || r.length < 3) continue;
-
-          let municipio = (r[0] || '').toString().trim();
-          let comuna = (r[2] || sheetName.trim()).toString().trim();
-          let comision = (r[4] || '').toString().trim();
-          let nombre = (r[6] || r[5] || r[1] || '').toString().trim();
-          let cedulaRaw = r[8] || r[7] || r[2];
-          let telefonoRaw = r[10] || r[9] || r[3] || '';
-
-          if (!nombre || nombre.toUpperCase().includes('NOMBRE') || nombre.toUpperCase().includes('COMUNA')) continue;
-
-          let cedula = cedulaRaw ? String(cedulaRaw).replace(/[^0-9]/g, '') : '';
-          if (!cedula) continue;
-
-          let telefono = telefonoRaw ? String(telefonoRaw).trim() : '';
-
-          try {
-            await db.prepare(`
-              INSERT INTO personas (cedula, nombre_apellido, municipio, comuna, comision, telefono)
-              VALUES (?, ?, ?, ?, ?, ?)
-              ON CONFLICT (cedula) DO NOTHING
-            `).run(
-              cedula,
-              nombre.toUpperCase(),
-              municipio || 'BOLIVAR',
-              comuna || sheetName.trim(),
-              comision || 'GENERAL',
-              telefono
-            );
-            importedCount++;
-          } catch (e) {
-            // Ignore duplicates
-          }
-        }
+    for (const p of personas) {
+      try {
+        const res = await db.prepare(`
+          INSERT OR IGNORE INTO personas (cedula, nombre_apellido, municipio, comuna, comision, telefono)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          p.cedula,
+          p.nombre_apellido,
+          p.municipio || 'BOLIVAR',
+          p.comuna,
+          p.comision || 'GENERAL',
+          p.telefono || ''
+        );
+        if (res.changes > 0) importedCount++;
+      } catch (e) {
+        // Ignorar duplicados
       }
     }
 
-    console.log(`✅ ¡Se importaron con éxito ${importedCount} personas a la base de datos!`);
+    if (importedCount > 0) {
+      console.log(`✅ ¡Se importaron ${importedCount} nuevas personas desde los archivos Excel a la base de datos!`);
+      await db.prepare(`
+        INSERT INTO bitacora (usuario_id, usuario_nombre, rol, accion, detalle)
+        VALUES (1, 'Sistema', 'SYSTEM', 'IMPORTACION_EXCEL', 'Importación de ${importedCount} personas desde los archivos Excel (Equipos Comunales, EPM, Jefes de UBCH).')
+      `).run();
+    } else {
+      console.log('ℹ️ Todos los registros de las hojas Excel ya se encuentran en la base de datos.');
+    }
   } catch (err) {
-    console.error('❌ Error al procesar el archivo Excel:', err);
+    console.error('❌ Error al procesar archivos Excel:', err);
   }
 }
 
 function seedPersonasFromExcelSync() {
-  const { count } = db.prepare('SELECT COUNT(*) as count FROM personas').get();
-
-  if (parseInt(count || 0) > 0) {
-    console.log(`ℹ️ La base de datos ya contiene ${count} personas.`);
-    return;
-  }
-
-  const excelPath = path.join(__dirname, '../Equipos Comunales PSUV BOLIVAR.xlsx');
-  if (!fs.existsSync(excelPath)) {
-    console.warn('⚠️ No se encontró el archivo Excel "Equipos Comunales PSUV BOLIVAR.xlsx" para sembrar personas.');
-    return;
-  }
-
-  console.log('📊 Leyendo datos desde Equipos Comunales PSUV BOLIVAR.xlsx...');
+  console.log('📊 Verificando e importando personas de los archivos Excel (Local)...');
   try {
-    const workbook = xlsx.readFile(excelPath);
+    const personas = parseAllPersonasFromExcels();
+    const insertPersona = db.prepare(`
+      INSERT OR IGNORE INTO personas (cedula, nombre_apellido, municipio, comuna, comision, telefono)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+
     let importedCount = 0;
-
-    workbook.SheetNames.forEach((sheetName) => {
-      const sheet = workbook.Sheets[sheetName];
-      const data = xlsx.utils.sheet_to_json(sheet, { header: 1 });
-
-      let headerIdx = -1;
-      for (let i = 0; i < data.length; i++) {
-        const rowStr = (data[i] || []).map(c => String(c)).join(' ').toUpperCase();
-        if (rowStr.includes('NOMBRE') || rowStr.includes('CEDULA')) {
-          headerIdx = i;
-          break;
-        }
-      }
-
-      if (headerIdx !== -1) {
-        for (let j = headerIdx + 1; j < data.length; j++) {
-          const r = data[j];
-          if (!r || r.length < 3) continue;
-
-          let municipio = (r[0] || '').toString().trim();
-          let comuna = (r[2] || sheetName.trim()).toString().trim();
-          let comision = (r[4] || '').toString().trim();
-          let nombre = (r[6] || r[5] || r[1] || '').toString().trim();
-          let cedulaRaw = r[8] || r[7] || r[2];
-          let telefonoRaw = r[10] || r[9] || r[3] || '';
-
-          if (!nombre || nombre.toUpperCase().includes('NOMBRE') || nombre.toUpperCase().includes('COMUNA')) continue;
-
-          let cedula = cedulaRaw ? String(cedulaRaw).replace(/[^0-9]/g, '') : '';
-          if (!cedula) continue;
-
-          let telefono = telefonoRaw ? String(telefonoRaw).trim() : '';
-
-          try {
-            db.prepare(`
-              INSERT OR IGNORE INTO personas (cedula, nombre_apellido, municipio, comuna, comision, telefono)
-              VALUES (?, ?, ?, ?, ?, ?)
-            `).run(
-              cedula,
-              nombre.toUpperCase(),
-              municipio || 'BOLIVAR',
-              comuna || sheetName.trim(),
-              comision || 'GENERAL',
-              telefono
-            );
-            importedCount++;
-          } catch (e) {}
-        }
+    const insertMany = db.transaction((rows) => {
+      for (const p of rows) {
+        const res = insertPersona.run(
+          p.cedula,
+          p.nombre_apellido,
+          p.municipio || 'BOLIVAR',
+          p.comuna,
+          p.comision || 'GENERAL',
+          p.telefono || ''
+        );
+        if (res.changes > 0) importedCount++;
       }
     });
 
-    console.log(`✅ ¡Se importaron con éxito ${importedCount} personas desde el archivo Excel!`);
+    insertMany(personas);
+
+    if (importedCount > 0) {
+      console.log(`✅ ¡Se importaron ${importedCount} nuevas personas desde los archivos Excel!`);
+      db.prepare(`
+        INSERT INTO bitacora (usuario_id, usuario_nombre, rol, accion, detalle)
+        VALUES (1, 'Sistema', 'SYSTEM', 'IMPORTACION_EXCEL', 'Importación de ${importedCount} personas desde los archivos Excel (Equipos Comunales, EPM, Jefes de UBCH).')
+      `).run();
+    } else {
+      console.log('ℹ️ Todos los registros de las hojas Excel ya se encuentran en la base de datos local.');
+    }
   } catch (err) {
-    console.error('❌ Error al procesar el archivo Excel:', err);
+    console.error('❌ Error al procesar archivos Excel local:', err);
   }
 }
 
